@@ -2,8 +2,9 @@ const express = require('express');
 const router = express.Router();
 const cloudinary = require('../config/cloudinary');
 const geminiService = require('../config/gemini');
-const Meme = require('../models/Meme');
+// const Meme = require('../models/Meme');
 const { upload, handleMulterError } = require('../middleware/upload');
+const connectToDB = require('../db'); // Assuming you have a separate file for DB connection
 
 // Upload meme endpoint
 router.post('/upload', upload.single('meme'), handleMulterError, async (req, res) => {
@@ -52,33 +53,41 @@ router.post('/upload', upload.single('meme'), handleMulterError, async (req, res
       }
     }
 
+    // Connect to database
+    const db = await connectToDB();
+
     // Create meme document with description
-    const meme = new Meme({
+    const memeData = {
       image_url: uploadResult.secure_url,
       cloudinary_id: uploadResult.public_id,
       tags: tags,
       description: description.toLowerCase(), // Convert to lowercase for consistency
+      upvotes: 0,
+      downloads: 0,
       metadata: {
         width: uploadResult.width,
         height: uploadResult.height,
         format: uploadResult.format,
         size: uploadResult.bytes
-      }
-    });
+      },
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
 
-    await meme.save();
+    const result = await db.collection("memes").insertOne(memeData);
+    const insertedMeme = await db.collection("memes").findOne({ _id: result.insertedId });
 
     res.status(201).json({
       success: true,
       message: 'Meme uploaded successfully',
       meme: {
-        id: meme._id,
-        image_url: meme.image_url,
-        tags: meme.tags,
-        description: meme.description,
-        upvotes: meme.upvotes,
-        downloads: meme.downloads,
-        createdAt: meme.createdAt
+        id: insertedMeme._id,
+        image_url: insertedMeme.image_url,
+        tags: insertedMeme.tags,
+        description: insertedMeme.description,
+        upvotes: insertedMeme.upvotes,
+        downloads: insertedMeme.downloads,
+        createdAt: insertedMeme.createdAt
       },
       metadata: {
         descriptionGenerated: req.body.description === "" || !req.body.description
@@ -135,21 +144,16 @@ router.get('/search', async (req, res) => {
         ]
     };
 
-    // For better relevance, we can also use text search if we add text indexes
-    // Alternative approach using $text search (requires text index)
-    // const searchQuery = {
-    //   $text: { $search: q }
-    // };
+    // Connect to database
+    const db = await connectToDB();
 
-    const memes = await Meme.find(searchQuery)
-      .sort({ 
-        // Sort by relevance (more matches = higher relevance) and then by date
-        createdAt: -1 
-      })
+    const memes = await db.collection("memes").find(searchQuery)
+      .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(parseInt(limit));
+      .limit(parseInt(limit))
+      .toArray();
 
-    const total = await Meme.countDocuments(searchQuery);
+    const total = await db.collection("memes").countDocuments(searchQuery);
 
     // Calculate relevance score for each meme
     const memesWithRelevance = memes.map(meme => {
@@ -212,6 +216,47 @@ router.get('/search', async (req, res) => {
   }
 });
 
+// Search assist - get tag suggestions
+router.get('/search-assist', async (req, res) => {
+  try {
+    const { q } = req.query;
+    
+    if (!q) {
+      return res.json({
+        success: true,
+        tags: []
+      });
+    }
+
+    const searchRegex = new RegExp(q.toLowerCase(), 'i');
+    
+    // Connect to database
+    const db = await connectToDB();
+    
+    // Aggregate to get unique tags that match the search query
+    const tagSuggestions = await db.collection("memes").aggregate([
+      { $unwind: '$tags' },
+      { $match: { tags: searchRegex } },
+      { $group: { _id: '$tags', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 },
+      { $project: { tag: '$_id', count: 1, _id: 0 } }
+    ]).toArray();
+
+    res.json({
+      success: true,
+      tags: tagSuggestions.map(item => item.tag)
+    });
+
+  } catch (error) {
+    console.error('Search assist error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Search assist failed',
+      error: error.message
+    });
+  }
+});
 
 // Get trending memes
 router.get('/trending', async (req, res) => {
@@ -223,8 +268,11 @@ router.get('/trending', async (req, res) => {
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
+    // Connect to database
+    const db = await connectToDB();
+
     // Get memes with trending score calculation
-    const trendingMemes = await Meme.aggregate([
+    const trendingMemes = await db.collection("memes").aggregate([
       {
         $addFields: {
           // Calculate days since creation
@@ -290,10 +338,10 @@ router.get('/trending', async (req, res) => {
           daysSinceCreation: { $round: ['$daysSinceCreation', 1] }
         }
       }
-    ]);
+    ]).toArray();
 
     // Get total count for pagination
-    const totalTrending = await Meme.aggregate([
+    const totalTrending = await db.collection("memes").aggregate([
       {
         $addFields: {
           daysSinceCreation: {
@@ -312,12 +360,12 @@ router.get('/trending', async (req, res) => {
       {
         $count: "total"
       }
-    ]);
+    ]).toArray();
 
     const total = totalTrending.length > 0 ? totalTrending[0].total : 0;
 
     // Also get the most trending tag for additional context
-    const tagStats = await Meme.aggregate([
+    const tagStats = await db.collection("memes").aggregate([
       {
         $match: {
           createdAt: { $gte: sevenDaysAgo }
@@ -342,7 +390,7 @@ router.get('/trending', async (req, res) => {
       },
       { $sort: { trendingScore: -1, count: -1 } },
       { $limit: 1 }
-    ]);
+    ]).toArray();
 
     const mostTrendingTag = tagStats.length > 0 ? tagStats[0]._id : null;
 
@@ -387,7 +435,10 @@ router.get('/popular', async (req, res) => {
   try {
     const { limit = 30 } = req.query;
 
-    const popularTags = await Meme.aggregate([
+    // Connect to database
+    const db = await connectToDB();
+
+    const popularTags = await db.collection("memes").aggregate([
       { $unwind: '$tags' },
       { 
         $group: { 
@@ -410,7 +461,7 @@ router.get('/popular', async (req, res) => {
           _id: 0 
         } 
       }
-    ]);
+    ]).toArray();
 
     res.json({
       success: true,
@@ -538,23 +589,31 @@ router.post('/update-upvote', async (req, res) => {
       });
     }
 
-    const meme = await Meme.findById(memeId);
-    if (!meme) {
+    // Connect to database
+    const db = await connectToDB();
+    const { ObjectId } = require('mongodb');
+
+    const result = await db.collection("memes").findOneAndUpdate(
+      { _id: new ObjectId(memeId) },
+      { 
+        $inc: { upvotes: 1 },
+        $set: { updatedAt: new Date() }
+      },
+      { returnDocument: 'after' }
+    );
+
+    if (!result.value) {
       return res.status(404).json({
         success: false,
         message: 'Meme not found'
       });
     }
 
-    // Only upvote - increment by 1
-    meme.upvotes += 1;
-    await meme.save();
-
     res.json({
       success: true,
       message: 'Meme upvoted successfully',
-      upvotes: meme.upvotes,
-      memeId: meme._id
+      upvotes: result.value.upvotes,
+      memeId: result.value._id
     });
 
   } catch (error) {
@@ -579,13 +638,20 @@ router.post('/track-downloads', async (req, res) => {
       });
     }
 
-    const meme = await Meme.findByIdAndUpdate(
-      memeId,
-      { $inc: { downloads: 1 } },
-      { new: true }
+    // Connect to database
+    const db = await connectToDB();
+    const { ObjectId } = require('mongodb');
+
+    const result = await db.collection("memes").findOneAndUpdate(
+      { _id: new ObjectId(memeId) },
+      { 
+        $inc: { downloads: 1 },
+        $set: { updatedAt: new Date() }
+      },
+      { returnDocument: 'after' }
     );
 
-    if (!meme) {
+    if (!result.value) {
       return res.status(404).json({
         success: false,
         message: 'Meme not found'
@@ -594,7 +660,7 @@ router.post('/track-downloads', async (req, res) => {
 
     res.json({
       success: true,
-      downloads: meme.downloads
+      downloads: result.value.downloads
     });
 
   } catch (error) {
@@ -634,12 +700,16 @@ router.get('/memes', async (req, res) => {
       sortCriteria = { upvotes: -1, createdAt: -1 };
     }
 
-    const memes = await Meme.find(query)
+    // Connect to database
+    const db = await connectToDB();
+
+    const memes = await db.collection("memes").find(query)
       .sort(sortCriteria)
       .skip(skip)
-      .limit(parseInt(limit));
+      .limit(parseInt(limit))
+      .toArray();
 
-    const total = await Meme.countDocuments(query);
+    const total = await db.collection("memes").countDocuments(query);
 
     res.json({
       success: true,
@@ -671,5 +741,66 @@ router.get('/memes', async (req, res) => {
   }
 });
 
+// Get memes by specific tag (this must be last among GET routes)
+router.get('/:tag', async (req, res) => {
+  try {
+    const { tag } = req.params;
+    const { page = 1, limit = 20, sort = 'recent' } = req.query;
+    
+    const skip = (page - 1) * limit;
+    
+    // Determine sort criteria
+    let sortCriteria = { createdAt: -1 }; // default: recent
+    if (sort === 'popular') {
+      sortCriteria = { upvotes: -1, downloads: -1 };
+    } else if (sort === 'trending') {
+      sortCriteria = { upvotes: -1, createdAt: -1 };
+    }
+
+    // Connect to database
+    const db = await connectToDB();
+
+    const memes = await db.collection("memes").find({
+      tags: tag.toLowerCase()
+    })
+    .sort(sortCriteria)
+    .skip(skip)
+    .limit(parseInt(limit))
+    .toArray();
+
+    const total = await db.collection("memes").countDocuments({
+      tags: tag.toLowerCase()
+    });
+
+    res.json({
+      success: true,
+      tag: tag,
+      memes: memes.map(meme => ({
+        id: meme._id,
+        image_url: meme.image_url,
+        tags: meme.tags,
+        upvotes: meme.upvotes,
+        downloads: meme.downloads,
+        title: meme.title,
+        description: meme.description,
+        createdAt: meme.createdAt
+      })),
+      pagination: {
+        current: parseInt(page),
+        total: Math.ceil(total / limit),
+        count: memes.length,
+        totalItems: total
+      }
+    });
+
+  } catch (error) {
+    console.error('Get by tag error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get memes by tag',
+      error: error.message
+    });
+  }
+});
 
 module.exports = router;
